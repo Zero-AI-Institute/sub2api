@@ -65,7 +65,18 @@
           <!-- 模型名 + 非 token 计费模式徽章;分时时段行额外标注时段 -->
           <td class="border-r border-gray-100 py-2.5 pl-5 pr-4 align-middle dark:border-dark-700/60">
             <div class="flex flex-wrap items-center gap-1.5">
-              <span class="font-medium text-gray-900 dark:text-white">{{ m.name }}</span>
+              <span class="inline-flex min-w-0 items-center gap-1">
+                <span class="min-w-0 break-words font-medium text-gray-900 dark:text-white">{{ m.name }}</span>
+                <button
+                  type="button"
+                  class="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded text-gray-500 transition-colors hover:bg-gray-100 hover:text-primary-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500 dark:text-dark-300 dark:hover:bg-dark-700 dark:hover:text-primary-400"
+                  :title="t('modelPlaza.table.copyModelId', { model: m.name })"
+                  :aria-label="t('modelPlaza.table.copyModelId', { model: m.name })"
+                  @click="copyToClipboard(m.name)"
+                >
+                  <Icon name="copy" size="sm" aria-hidden="true" />
+                </button>
+              </span>
               <!-- 时段徽章紧跟模型名,其余徽章排在后面,空间不足时先换行的是它们 -->
               <span
                 v-if="period"
@@ -100,11 +111,13 @@
                 {{ t('modelPlaza.table.marginalBadge') }}
               </span>
               <span
-                v-if="m.pricing?.max_reasoning_effort_multiplier"
+                v-for="([effort, multiplier]) in reasoningEffortMultipliers(m)"
+                :key="effort"
                 class="rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-900/20 dark:text-amber-300"
-                :title="t('modelPlaza.table.maxReasoningMultiplierHint', { multiplier: m.pricing.max_reasoning_effort_multiplier })"
+                :title="t('modelPlaza.table.reasoningMultiplierHint', { effort, multiplier })"
+                :data-reasoning-effort="effort"
               >
-                {{ t('modelPlaza.table.maxReasoningMultiplierBadge', { multiplier: m.pricing.max_reasoning_effort_multiplier }) }}
+                {{ t('modelPlaza.table.reasoningMultiplierBadge', { effort, multiplier }) }}
               </span>
             </div>
           </td>
@@ -145,11 +158,14 @@
                   class="whitespace-nowrap font-mono text-xs leading-5 text-gray-800 dark:text-gray-200"
                   :title="tierHint(m)"
                 >
-                  <template v-if="iv.cache_write_price != null || iv.cache_write_1h_price != null || iv.cache_read_price != null">
+                  <template v-if="iv.cache_write_price != null || iv.cache_write_1h_price != null || iv.cache_write_12h_price != null || iv.cache_read_price != null">
                     <span class="font-sans font-normal text-gray-400 dark:text-dark-500">{{ t('modelPlaza.table.cacheWriteShort') }}</span>
                     {{ paidPerMillion(iv.cache_write_price, period) }}
                     <template v-if="iv.cache_write_1h_price != null"
                       ><span class="font-sans font-normal text-gray-400 dark:text-dark-500"> (1h </span>{{ paidPerMillion(iv.cache_write_1h_price, period)
+                      }}<span class="font-sans font-normal text-gray-400 dark:text-dark-500">)</span></template
+                    ><template v-if="iv.cache_write_12h_price != null"
+                      ><span class="font-sans font-normal text-gray-400 dark:text-dark-500"> (12h </span>{{ paidPerMillion(iv.cache_write_12h_price, period)
                       }}<span class="font-sans font-normal text-gray-400 dark:text-dark-500">)</span></template
                     >
                     <span class="ml-1 font-sans font-normal text-gray-400 dark:text-dark-500">{{ t('modelPlaza.table.cacheReadShort') }}</span>
@@ -167,6 +183,9 @@
                   {{ paidPerMillion(m.pricing?.cache_write_price, period)
                   }}<template v-if="m.pricing?.cache_write_1h_price != null"
                     ><span class="font-sans font-normal text-gray-400 dark:text-dark-500"> (1h </span>{{ paidPerMillion(m.pricing.cache_write_1h_price, period)
+                    }}<span class="font-sans font-normal text-gray-400 dark:text-dark-500">)</span></template
+                  ><template v-if="m.pricing?.cache_write_12h_price != null"
+                    ><span class="font-sans font-normal text-gray-400 dark:text-dark-500"> (12h </span>{{ paidPerMillion(m.pricing.cache_write_12h_price, period)
                     }}<span class="font-sans font-normal text-gray-400 dark:text-dark-500">)</span></template
                   >
                 </div>
@@ -243,11 +262,14 @@
                 class="whitespace-nowrap font-mono text-xs leading-5 text-gray-500 dark:text-dark-400"
                 :title="t('modelPlaza.table.tierHint')"
               >
-                <template v-if="iv.cache_write_price != null || iv.cache_write_1h_price != null || iv.cache_read_price != null">
+                <template v-if="iv.cache_write_price != null || iv.cache_write_1h_price != null || iv.cache_write_12h_price != null || iv.cache_read_price != null">
                   <span class="font-sans text-gray-400 dark:text-dark-500">{{ t('modelPlaza.table.cacheWriteShort') }}</span>
                   {{ official(iv.cache_write_price) }}
                   <template v-if="iv.cache_write_1h_price != null"
                     ><span class="font-sans text-gray-400 dark:text-dark-500"> (1h </span>{{ official(iv.cache_write_1h_price)
+                    }}<span class="font-sans text-gray-400 dark:text-dark-500">)</span></template
+                  ><template v-if="iv.cache_write_12h_price != null"
+                    ><span class="font-sans text-gray-400 dark:text-dark-500"> (12h </span>{{ official(iv.cache_write_12h_price)
                     }}<span class="font-sans text-gray-400 dark:text-dark-500">)</span></template
                   >
                   <span class="ml-1 font-sans text-gray-400 dark:text-dark-500">{{ t('modelPlaza.table.cacheReadShort') }}</span>
@@ -265,6 +287,9 @@
                 {{ official(m.official_pricing.cache_write_price)
                 }}<template v-if="m.official_pricing.cache_write_1h_price != null"
                   ><span class="font-sans text-gray-400 dark:text-dark-500"> (1h </span>{{ official(m.official_pricing.cache_write_1h_price)
+                  }}<span class="font-sans text-gray-400 dark:text-dark-500">)</span></template
+                ><template v-if="m.official_pricing.cache_write_12h_price != null"
+                  ><span class="font-sans text-gray-400 dark:text-dark-500"> (12h </span>{{ official(m.official_pricing.cache_write_12h_price)
                   }}<span class="font-sans text-gray-400 dark:text-dark-500">)</span></template
                 >
               </div>
@@ -287,7 +312,7 @@
               >{{ periodRate(period) }}x</span
             >
             <span
-              v-else-if="usesIndependentImageRate(m)"
+              v-else-if="usesIndependentMediaRate(m)"
               class="font-bold text-gray-700 dark:text-gray-300"
               >{{ requestRate(m) }}x</span
             >
@@ -306,15 +331,29 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
+import Icon from '@/components/icons/Icon.vue'
+import { useClipboard } from '@/composables/useClipboard'
 import { formatScaled, resolveIntervalPrices } from '@/utils/pricing'
 import { platformAccentColor, platformBadgeLightClass, platformLabel } from '@/utils/platformColors'
 import {
   BILLING_MODE_TOKEN,
   BILLING_MODE_IMAGE,
+  BILLING_MODE_VIDEO,
+  REASONING_EFFORT_LEVELS,
   type BillingMode
 } from '@/constants/channel'
 import type { PlazaModel, PlazaTimePricingPeriod } from '@/api/modelPlaza'
 import type { UserPricingInterval } from '@/api/channels'
+
+function reasoningEffortMultipliers(model: PlazaModel): [string, number][] {
+  const multipliers = model.pricing?.reasoning_effort_multipliers
+  return REASONING_EFFORT_LEVELS.flatMap(effort => {
+    const multiplier = multipliers?.[effort]
+    return typeof multiplier === 'number' && Number.isFinite(multiplier) && multiplier > 0
+      ? [[effort, multiplier] as [string, number]]
+      : []
+  })
+}
 
 const props = defineProps<{
   models: PlazaModel[]
@@ -327,6 +366,9 @@ const props = defineProps<{
   /** 生图独立倍率:true 时图片计费模型的实付倍率取 imageRateMultiplier,不取分组/专属倍率。 */
   imageRateIndependent?: boolean
   imageRateMultiplier?: number | null
+  /** 视频独立倍率开启时，覆盖分组/用户专属倍率，与后端视频计费保持一致。 */
+  videoRateIndependent?: boolean
+  videoRateMultiplier?: number | null
   /**
    * 高峰窗口描述(含倍率与服务器时区标注),空串/缺省 = 分组未启用高峰。
    * 表格所有价格均为不含高峰因子的口径,该窗口仅用于分时时段行的 tooltip 披露:
@@ -337,6 +379,7 @@ const props = defineProps<{
 }>()
 
 const { t } = useI18n()
+const { copyToClipboard } = useClipboard()
 
 /** 实付分区只从平台拿一个主色,浅底/标题/下划线全部由 scoped CSS 用 color-mix 派生。 */
 const accentStyle = computed(() => ({ '--plaza-accent': platformAccentColor(props.platform ?? '') }))
@@ -412,17 +455,23 @@ function paidPerMillion(value: number | null | undefined, period: PlazaTimePrici
   return formatScaled(value * rate, PER_MILLION, MIN_DECIMALS)
 }
 
-/** 图片计费模型且分组开启生图独立倍率:实付倍率取独立倍率,与计费口径一致。 */
-function usesIndependentImageRate(m: PlazaModel): boolean {
-  return billingMode(m) === BILLING_MODE_IMAGE && props.imageRateIndependent === true
+/** 图片和视频分别使用对应的独立倍率开关。 */
+function usesIndependentMediaRate(m: PlazaModel): boolean {
+  return (billingMode(m) === BILLING_MODE_IMAGE && props.imageRateIndependent === true) ||
+    (billingMode(m) === BILLING_MODE_VIDEO && props.videoRateIndependent === true)
 }
 
-/** 按次/按图片行的生效倍率。 */
+/** 非 token 行的生效倍率，图片和视频可分别覆盖通用倍率。 */
 function requestRate(m: PlazaModel): number {
-  return usesIndependentImageRate(m) ? (props.imageRateMultiplier ?? 1) : effectiveRate.value
+  if (billingMode(m) === BILLING_MODE_VIDEO && props.videoRateIndependent === true) {
+    return Math.max(0, props.videoRateMultiplier ?? 1)
+  }
+  return billingMode(m) === BILLING_MODE_IMAGE && props.imageRateIndependent === true
+    ? (props.imageRateMultiplier ?? 1)
+    : effectiveRate.value
 }
 
-/** 按次 / 按图片单价(乘该行生效倍率,不换算 1M)。 */
+/** 非 token 单价乘该行生效倍率，不换算为每百万 token。 */
 function paidRequestPrice(m: PlazaModel, value: number | null | undefined): string {
   if (value == null) return '-'
   return formatScaled(value * requestRate(m), 1, MIN_DECIMALS)
@@ -442,11 +491,11 @@ function perUnitSuffix(m: PlazaModel): string {
 }
 
 function hasCachePricing(m: PlazaModel): boolean {
-  return m.pricing?.cache_write_price != null || m.pricing?.cache_write_1h_price != null || m.pricing?.cache_read_price != null
+  return m.pricing?.cache_write_price != null || m.pricing?.cache_write_1h_price != null || m.pricing?.cache_write_12h_price != null || m.pricing?.cache_read_price != null
 }
 
 function hasOfficialCache(o: NonNullable<PlazaModel['official_pricing']>): boolean {
-  return o.cache_write_price != null || o.cache_read_price != null || o.cache_write_1h_price != null
+  return o.cache_write_price != null || o.cache_read_price != null || o.cache_write_1h_price != null || o.cache_write_12h_price != null
 }
 
 /** 分时倍率时段(后端只给出倍率 ≠ 1 的时段,已升序)。 */
@@ -496,7 +545,7 @@ function officialIntervals(m: PlazaModel): UserPricingInterval[] {
 /** 任一档带缓存价才按档渲染缓存列;否则沿用平价的写入/读取两行。 */
 function hasTierCachePricing(intervals: UserPricingInterval[]): boolean {
   return intervals.some((iv) =>
-    iv.cache_write_price != null || iv.cache_write_1h_price != null || iv.cache_read_price != null ||
+    iv.cache_write_price != null || iv.cache_write_1h_price != null || iv.cache_write_12h_price != null || iv.cache_read_price != null ||
     iv.cache_write_multiplier != null || iv.cache_read_multiplier != null
   )
 }

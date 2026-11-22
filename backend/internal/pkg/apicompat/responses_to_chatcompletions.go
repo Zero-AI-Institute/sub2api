@@ -15,7 +15,8 @@ import (
 
 // ResponsesToChatCompletions converts a Responses API response into a Chat
 // Completions response. Text output items are concatenated into
-// choices[0].message.content; function_call items become tool_calls.
+// choices[0].message.content, refusal parts into choices[0].message.refusal;
+// function_call items become tool_calls.
 func ResponsesToChatCompletions(resp *ResponsesResponse, model string) *ChatCompletionsResponse {
 	id := resp.ID
 	if id == "" {
@@ -31,6 +32,7 @@ func ResponsesToChatCompletions(resp *ResponsesResponse, model string) *ChatComp
 	}
 
 	var contentText string
+	var refusalText string
 	var reasoningText string
 	var toolCalls []ChatToolCall
 
@@ -38,8 +40,11 @@ func ResponsesToChatCompletions(resp *ResponsesResponse, model string) *ChatComp
 		switch item.Type {
 		case "message":
 			for _, part := range item.Content {
-				if part.Type == "output_text" && part.Text != "" {
+				switch {
+				case part.Type == "output_text" && part.Text != "":
 					contentText += part.Text
+				case part.Type == "refusal" && part.Refusal != "":
+					refusalText += part.Refusal
 				}
 			}
 		case "function_call":
@@ -51,18 +56,26 @@ func ResponsesToChatCompletions(resp *ResponsesResponse, model string) *ChatComp
 					Arguments: item.Arguments,
 				},
 			})
-		case "reasoning":
-			for _, s := range item.Summary {
-				if s.Type == "summary_text" && s.Text != "" {
-					reasoningText += s.Text
-				}
+		case "custom_tool_call":
+			if !resp.RenderCustomToolCalls || (resp.XAIServerSideSearch && IsServerSideSearchCall(item.Type, item.CallID)) {
+				continue
 			}
+			toolCalls = append(toolCalls, ChatToolCall{
+				ID:   item.CallID,
+				Type: "function",
+				Function: ChatFunctionCall{
+					Name:      item.Name,
+					Arguments: item.Input,
+				},
+			})
+		case "reasoning":
+			reasoningText += responsesReasoningText(item)
 		case "web_search_call":
 			// silently consumed — results already incorporated into text output
 		}
 	}
 
-	msg := ChatMessage{Role: "assistant"}
+	msg := ChatMessage{Role: "assistant", Refusal: refusalText}
 	if len(toolCalls) > 0 {
 		msg.ToolCalls = toolCalls
 	}
@@ -127,8 +140,14 @@ type ResponsesEventToChatState struct {
 	NextToolCallIndex      int         // next sequential tool_call index to assign
 	OutputIndexToToolIndex map[int]int // Responses output_index → Chat tool_calls index
 	OutputIndexToArguments map[int]string
+	argumentBuffers        map[int]*strings.Builder
 	IncludeUsage           bool
 	Usage                  *ChatUsage
+
+	// XAIServerSideSearch is set by callers whose upstream is xAI. A
+	// custom_tool_call that IsServerSideSearchCall then never becomes a tool
+	// call, because xAI runs it itself.
+	XAIServerSideSearch bool
 }
 
 // NewResponsesEventToChatState returns an initialised stream state.
@@ -149,6 +168,8 @@ func ResponsesEventToChatChunks(evt *ResponsesStreamEvent, state *ResponsesEvent
 		return resToChatHandleCreated(evt, state)
 	case "response.output_text.delta":
 		return resToChatHandleTextDelta(evt, state)
+	case "response.refusal.delta":
+		return resToChatHandleRefusalDelta(evt, state)
 	case "response.output_item.added":
 		return resToChatHandleOutputItemAdded(evt, state)
 	case "response.function_call_arguments.delta",
@@ -248,10 +269,21 @@ func resToChatHandleTextDelta(evt *ResponsesStreamEvent, state *ResponsesEventTo
 	return []ChatCompletionsChunk{makeChatDeltaChunk(state, ChatDelta{Content: &content})}
 }
 
+func resToChatHandleRefusalDelta(evt *ResponsesStreamEvent, state *ResponsesEventToChatState) []ChatCompletionsChunk {
+	if evt.Delta == "" {
+		return nil
+	}
+	refusal := evt.Delta
+	return []ChatCompletionsChunk{makeChatDeltaChunk(state, ChatDelta{Refusal: &refusal})}
+}
+
 func resToChatHandleOutputItemAdded(evt *ResponsesStreamEvent, state *ResponsesEventToChatState) []ChatCompletionsChunk {
 	// function_call 与 custom_tool_call（custom/freeform 工具）均按工具调用注册，
 	// 以便后续 *_input.delta / *_arguments.delta 能映射到正确的工具索引。
 	if evt.Item == nil || (evt.Item.Type != "function_call" && evt.Item.Type != "custom_tool_call") {
+		return nil
+	}
+	if state.XAIServerSideSearch && IsServerSideSearchCall(evt.Item.Type, evt.Item.CallID) {
 		return nil
 	}
 
@@ -281,7 +313,7 @@ func resToChatHandleFuncArgsDelta(evt *ResponsesStreamEvent, state *ResponsesEve
 	if !ok {
 		return nil
 	}
-	state.OutputIndexToArguments[evt.OutputIndex] += evt.Delta
+	state.OutputIndexToArguments[evt.OutputIndex] = appendIndexedStreamString(&state.argumentBuffers, evt.OutputIndex, state.OutputIndexToArguments[evt.OutputIndex], evt.Delta)
 
 	return []ChatCompletionsChunk{makeChatDeltaChunk(state, ChatDelta{
 		ToolCalls: []ChatToolCall{{
@@ -310,6 +342,7 @@ func resToChatHandleFuncArgsDone(evt *ResponsesStreamEvent, state *ResponsesEven
 
 	remainder := completed[len(current):]
 	state.OutputIndexToArguments[evt.OutputIndex] = completed
+	delete(state.argumentBuffers, evt.OutputIndex)
 	return []ChatCompletionsChunk{makeChatDeltaChunk(state, ChatDelta{
 		ToolCalls: []ChatToolCall{{
 			Index: &idx,
@@ -485,20 +518,35 @@ func generateChatCmplID() string {
 // ---------------------------------------------------------------------------
 
 type bufferedFuncCall struct {
-	OutputIndex int
-	CallID      string
-	Name        string
-	Args        strings.Builder
+	OutputIndex           int
+	CallID                string
+	Name                  string
+	Namespace             string
+	EncryptedFunctionArgs json.RawMessage
+	EncryptedContent      string
+	Args                  strings.Builder
+	// ServerSideSearch marks a custom_tool_call the xAI server ran itself; it
+	// is rebuilt as that item, never as a client function_call.
+	ServerSideSearch bool
 }
 
 // BufferedResponseAccumulator collects content from Responses SSE delta events
 // so that non-streaming handlers can reconstruct output when the terminal event
 // (response.completed / response.done) carries an empty output array.
 type BufferedResponseAccumulator struct {
+	// tool_search_call items arrive complete on output_item.done.
+	toolSearchCalls []ResponsesOutput
+
 	text                 strings.Builder
+	refusal              strings.Builder
 	reasoning            strings.Builder
 	funcCalls            []bufferedFuncCall
 	outputIndexToFuncIdx map[int]int
+
+	// XAIServerSideSearch is set by callers whose upstream is xAI. A
+	// custom_tool_call that IsServerSideSearchCall is then rebuilt as that item
+	// instead of as a client function_call.
+	XAIServerSideSearch bool
 }
 
 // NewBufferedResponseAccumulator returns an initialised accumulator.
@@ -517,14 +565,22 @@ func (a *BufferedResponseAccumulator) ProcessEvent(event *ResponsesStreamEvent) 
 		if event.Delta != "" {
 			_, _ = a.text.WriteString(event.Delta)
 		}
+	case "response.refusal.delta":
+		if event.Delta != "" {
+			_, _ = a.refusal.WriteString(event.Delta)
+		}
 	case "response.output_item.added":
 		if event.Item != nil && (event.Item.Type == "function_call" || event.Item.Type == "custom_tool_call") {
 			idx := len(a.funcCalls)
 			a.outputIndexToFuncIdx[event.OutputIndex] = idx
 			a.funcCalls = append(a.funcCalls, bufferedFuncCall{
-				OutputIndex: event.OutputIndex,
-				CallID:      event.Item.CallID,
-				Name:        event.Item.Name,
+				OutputIndex:           event.OutputIndex,
+				CallID:                event.Item.CallID,
+				Name:                  event.Item.Name,
+				Namespace:             event.Item.Namespace,
+				EncryptedFunctionArgs: event.Item.EncryptedFunctionArgs,
+				EncryptedContent:      event.Item.EncryptedContent,
+				ServerSideSearch:      a.XAIServerSideSearch && IsServerSideSearchCall(event.Item.Type, event.Item.CallID),
 			})
 		}
 	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
@@ -544,6 +600,10 @@ func (a *BufferedResponseAccumulator) ProcessEvent(event *ResponsesStreamEvent) 
 				_, _ = a.funcCalls[idx].Args.WriteString(completed)
 			}
 		}
+	case "response.output_item.done":
+		if event.Item != nil && event.Item.Type == "tool_search_call" {
+			a.toolSearchCalls = append(a.toolSearchCalls, *event.Item)
+		}
 	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 		if event.Delta != "" {
 			_, _ = a.reasoning.WriteString(event.Delta)
@@ -553,7 +613,7 @@ func (a *BufferedResponseAccumulator) ProcessEvent(event *ResponsesStreamEvent) 
 
 // HasContent reports whether any content has been accumulated.
 func (a *BufferedResponseAccumulator) HasContent() bool {
-	return a.text.Len() > 0 || len(a.funcCalls) > 0 || a.reasoning.Len() > 0
+	return a.text.Len() > 0 || a.refusal.Len() > 0 || len(a.funcCalls) > 0 || len(a.toolSearchCalls) > 0 || a.reasoning.Len() > 0
 }
 
 // BuildOutput constructs a []ResponsesOutput from the accumulated delta
@@ -572,25 +632,42 @@ func (a *BufferedResponseAccumulator) BuildOutput() []ResponsesOutput {
 		})
 	}
 
-	if a.text.Len() > 0 {
+	if a.text.Len() > 0 || a.refusal.Len() > 0 {
+		var content []ResponsesContentPart
+		if a.text.Len() > 0 {
+			content = append(content, ResponsesContentPart{Type: "output_text", Text: a.text.String()})
+		}
+		if a.refusal.Len() > 0 {
+			content = append(content, ResponsesContentPart{Type: "refusal", Refusal: a.refusal.String()})
+		}
 		out = append(out, ResponsesOutput{
-			Type: "message",
-			Role: "assistant",
-			Content: []ResponsesContentPart{{
-				Type: "output_text",
-				Text: a.text.String(),
-			}},
+			Type:    "message",
+			Role:    "assistant",
+			Content: content,
 		})
 	}
 
 	for i := range a.funcCalls {
+		if a.funcCalls[i].ServerSideSearch {
+			out = append(out, ResponsesOutput{
+				Type:   "custom_tool_call",
+				CallID: a.funcCalls[i].CallID,
+				Name:   a.funcCalls[i].Name,
+				Input:  a.funcCalls[i].Args.String(),
+			})
+			continue
+		}
 		out = append(out, ResponsesOutput{
-			Type:      "function_call",
-			CallID:    a.funcCalls[i].CallID,
-			Name:      a.funcCalls[i].Name,
-			Arguments: a.funcCalls[i].Args.String(),
+			Type:                  "function_call",
+			CallID:                a.funcCalls[i].CallID,
+			Name:                  a.funcCalls[i].Name,
+			Namespace:             a.funcCalls[i].Namespace,
+			EncryptedFunctionArgs: a.funcCalls[i].EncryptedFunctionArgs,
+			EncryptedContent:      a.funcCalls[i].EncryptedContent,
+			Arguments:             a.funcCalls[i].Args.String(),
 		})
 	}
+	out = append(out, a.toolSearchCalls...)
 
 	return out
 }
@@ -607,6 +684,24 @@ func (a *BufferedResponseAccumulator) SupplementResponseOutput(resp *ResponsesRe
 			resp.Output = a.BuildOutput()
 		}
 		return
+	}
+
+	// The terminal event can carry a non-empty output array whose message has
+	// no usable text. Trusting it as-is silently drops the text that already
+	// streamed: the client gets an empty reply while usage still bills the
+	// terminal output_tokens. Refill it from the accumulated deltas; non-empty
+	// terminal text stays authoritative.
+	if a.text.Len() > 0 && !responsesOutputHasText(resp.Output) {
+		if !fillResponsesOutputText(resp.Output, a.text.String()) {
+			resp.Output = append(resp.Output, ResponsesOutput{
+				Type: "message",
+				Role: "assistant",
+				Content: []ResponsesContentPart{{
+					Type: "output_text",
+					Text: a.text.String(),
+				}},
+			})
+		}
 	}
 
 	for outputIndex := range resp.Output {
@@ -626,4 +721,47 @@ func (a *BufferedResponseAccumulator) SupplementResponseOutput(resp *ResponsesRe
 			break
 		}
 	}
+}
+
+// responsesOutputHasText reports whether the terminal output already carries
+// usable message text. Whitespace-only text does not count.
+func responsesOutputHasText(output []ResponsesOutput) bool {
+	for i := range output {
+		if output[i].Type != "message" {
+			continue
+		}
+		for _, part := range output[i].Content {
+			if part.Type == "output_text" && strings.TrimSpace(part.Text) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// fillResponsesOutputText writes text into the first empty output_text part of
+// the first message item, adding an output_text part when that message has
+// none. It returns false when the output holds no message item, leaving the
+// caller to append one.
+func fillResponsesOutputText(output []ResponsesOutput, text string) bool {
+	for i := range output {
+		if output[i].Type != "message" {
+			continue
+		}
+		for j := range output[i].Content {
+			if output[i].Content[j].Type != "output_text" {
+				continue
+			}
+			if strings.TrimSpace(output[i].Content[j].Text) == "" {
+				output[i].Content[j].Text = text
+				return true
+			}
+		}
+		output[i].Content = append(output[i].Content, ResponsesContentPart{
+			Type: "output_text",
+			Text: text,
+		})
+		return true
+	}
+	return false
 }

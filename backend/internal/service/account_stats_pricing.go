@@ -19,7 +19,10 @@ import (
 // totalCost 是本次请求的客户计费（倍率前），用于优先级 2。
 // serviceTier 是最终参与用户计费的 OpenAI 服务层级，用于优先级 3。
 // pricingAt 与本次客户计费使用同一时刻，避免跨峰谷请求的成本与售价错位。
-// reasoningEffort 是最终转发等级；Fable 5.1 max 默认按 3 倍额度消耗。
+// longContextPricingEnabled 表示上游是否对本次请求收取长上下文费率，用于优先级 3；
+// 由 accountStatsLongContextPricingEnabled 按账号开关得出，不受分组售价开关影响。
+// upstreamPriceFactor 是上游按实际请求端点计价的倍数（见 ForwardResult.UpstreamPriceMultiplier），用于优先级 3。
+// reasoningEffort 是最终转发等级；按账号统计定价中配置的等级倍率计费。
 func resolveAccountStatsCost(
 	ctx context.Context,
 	channelService *ChannelService,
@@ -32,6 +35,8 @@ func resolveAccountStatsCost(
 	totalCost float64,
 	serviceTier string,
 	pricingAt time.Time,
+	longContextPricingEnabled bool,
+	upstreamPriceFactor float64,
 	reasoningEfforts ...string,
 ) *float64 {
 	reasoningEffort := ""
@@ -64,7 +69,11 @@ func resolveAccountStatsCost(
 
 	// 优先级 3：模型定价文件（LiteLLM）默认价格
 	if billingService != nil {
-		return tryModelFilePricing(billingService, upstreamModel, tokens, serviceTier, pricingAt, reasoningEffort)
+		cost := tryModelFilePricing(billingService, upstreamModel, tokens, serviceTier, pricingAt, longContextPricingEnabled, reasoningEffort)
+		if cost != nil && upstreamPriceFactor > 0 {
+			*cost *= upstreamPriceFactor
+		}
+		return cost
 	}
 
 	return nil
@@ -74,11 +83,16 @@ func resolveAccountStatsCost(
 // 与用户计费共用同一条定价管线，避免这里维护第二份"单价 × token 数"实现后，
 // 每加一个定价特性都要手工镜像一次。解析器不配置渠道或分组，保持优先级 3 的
 // 语义：只取模型定价文件，不引入自定义售价。
-func tryModelFilePricing(billingService *BillingService, model string, tokens UsageTokens, serviceTier string, pricingAt time.Time, reasoningEfforts ...string) *float64 {
+func tryModelFilePricing(billingService *BillingService, model string, tokens UsageTokens, serviceTier string, pricingAt time.Time, longContextPricingEnabled bool, reasoningEfforts ...string) *float64 {
 	reasoningEffort := ""
 	if len(reasoningEfforts) > 0 {
 		reasoningEffort = reasoningEfforts[0]
 	}
+	resolver := NewModelPricingResolver(nil, billingService)
+	resolved := resolver.Resolve(context.Background(), PricingInput{Model: model})
+	// 无分组的解析结果默认开启长上下文，CostInput.LongContextBillingEnabled=false 无法否决，
+	// 因此直接覆写解析结果。
+	resolved.longContextPricingEnabled = longContextPricingEnabled
 	breakdown, err := billingService.CalculateCostUnified(CostInput{
 		Ctx:             context.Background(),
 		Model:           model,
@@ -87,7 +101,8 @@ func tryModelFilePricing(billingService *BillingService, model string, tokens Us
 		ServiceTier:     normalizeBillingServiceTier(serviceTier),
 		ReasoningEffort: reasoningEffort,
 		PricingAt:       pricingAt,
-		Resolver:        NewModelPricingResolver(nil, billingService),
+		Resolver:        resolver,
+		Resolved:        resolved,
 	})
 	if err != nil || breakdown == nil || breakdown.TotalCost <= 0 {
 		return nil
@@ -116,7 +131,7 @@ func tryCustomRules(
 		}
 		cost := calculateStatsCost(pricing, tokens, requestCount)
 		if cost != nil {
-			*cost *= maxReasoningEffortBillingMultiplier(model, reasoningEffort, nil)
+			*cost *= reasoningEffortBillingMultiplier(reasoningEffort, pricing.ReasoningEffortMultipliers)
 		}
 		return cost
 	}
@@ -192,7 +207,7 @@ func calculateStatsCost(pricing *ChannelModelPricing, tokens UsageTokens, reques
 		return nil
 	}
 	switch pricing.BillingMode {
-	case BillingModePerRequest, BillingModeImage:
+	case BillingModePerRequest, BillingModeImage, BillingModeVideo:
 		return calculatePerRequestStatsCost(pricing, requestCount)
 	default:
 		return calculateTokenStatsCost(pricing, tokens)
@@ -217,12 +232,13 @@ func calculateTokenStatsCost(pricing *ChannelModelPricing, tokens UsageTokens) *
 		totalTokens := tokens.InputTokens + tokens.OutputTokens + tokens.CacheCreationTokens + tokens.CacheReadTokens
 		if iv := FindMatchingInterval(pricing.Intervals, totalTokens); iv != nil {
 			p = &ChannelModelPricing{
-				InputPrice:        iv.InputPrice,
-				OutputPrice:       iv.OutputPrice,
-				CacheWritePrice:   iv.CacheWritePrice,
-				CacheWrite1hPrice: iv.CacheWrite1hPrice,
-				CacheReadPrice:    iv.CacheReadPrice,
-				PerRequestPrice:   iv.PerRequestPrice,
+				InputPrice:         iv.InputPrice,
+				OutputPrice:        iv.OutputPrice,
+				CacheWritePrice:    iv.CacheWritePrice,
+				CacheWrite1hPrice:  iv.CacheWrite1hPrice,
+				CacheWrite12hPrice: iv.CacheWrite12hPrice,
+				CacheReadPrice:     iv.CacheReadPrice,
+				PerRequestPrice:    iv.PerRequestPrice,
 			}
 		}
 	}
@@ -234,11 +250,14 @@ func calculateTokenStatsCost(pricing *ChannelModelPricing, tokens UsageTokens) *
 	}
 	cacheCreationCost := float64(tokens.CacheCreationTokens) * deref(p.CacheWritePrice)
 	if p.CacheWrite1hPrice != nil {
-		cache5m, cache1h := normalizeCacheCreationBreakdown(tokens)
+		cache5m, cache1h := allocateCacheCreationBillingTokens(tokens)
 		if cache5m > 0 || cache1h > 0 {
 			cacheCreationCost = float64(cache5m)*deref(p.CacheWritePrice) +
 				float64(cache1h)*deref(p.CacheWrite1hPrice)
 		}
+	}
+	if cost, ok := openAICacheCreationTTLCost(tokens, deref(p.CacheWritePrice), p.CacheWrite12hPrice); ok {
+		cacheCreationCost = cost
 	}
 	cost := float64(tokens.InputTokens)*deref(p.InputPrice) +
 		float64(tokens.OutputTokens)*deref(p.OutputPrice) +
@@ -263,6 +282,8 @@ func applyAccountStatsCost(
 	tokens UsageTokens,
 	totalCost float64,
 	pricingAt time.Time,
+	longContextPricingEnabled bool,
+	upstreamPriceFactor float64,
 ) {
 	model := upstreamModel
 	if model == "" {
@@ -281,6 +302,14 @@ func applyAccountStatsCost(
 		reasoningEffort = *usageLog.ReasoningEffort
 	}
 	usageLog.AccountStatsCost = resolveAccountStatsCost(
-		ctx, cs, bs, accountID, groupID, model, tokens, requestCount, totalCost, serviceTier, pricingAt, reasoningEffort,
+		ctx, cs, bs, accountID, groupID, model, tokens, requestCount, totalCost, serviceTier, pricingAt, longContextPricingEnabled, upstreamPriceFactor, reasoningEffort,
 	)
+}
+
+// accountStatsLongContextPricingEnabled 判断账号统计成本是否计入长上下文阶梯。
+// 账号统计成本反映上游实际成本：OpenAI 账号由开关声明上游是否收取长上下文费率；
+// 其它平台没有该开关（accountGate 为 nil），按官方阶梯计。分组开关只决定客户售价，
+// 不参与成本判断。
+func accountStatsLongContextPricingEnabled(accountGate *bool) bool {
+	return accountGate == nil || *accountGate
 }

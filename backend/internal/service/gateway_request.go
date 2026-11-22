@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"math"
 	"regexp"
 	"sort"
@@ -60,13 +61,17 @@ type jsonRange struct {
 }
 
 type RequestBodyRef struct {
-	data []byte
+	data   []byte
+	parsed *gatewayRequestBodyState
 }
 
+// NewRequestBodyRef borrows immutable data. Callers must replace the body rather
+// than modify its backing storage while any request or attempt still borrows it.
 func NewRequestBodyRef(data []byte) *RequestBodyRef {
 	return &RequestBodyRef{data: data}
 }
 
+// Bytes returns a read-only view; use Replace to invalidate parsed state.
 func (b *RequestBodyRef) Bytes() []byte {
 	if b == nil {
 		return nil
@@ -86,6 +91,55 @@ func (b *RequestBodyRef) Replace(data []byte) {
 		return
 	}
 	b.data = data
+	// Even replacing with the same slice invalidates the snapshot. Callers may
+	// have reused storage after releasing its previous immutable view.
+	b.parsed = nil
+}
+
+// gatewayRequestBodySeed keys body fingerprints for this process only.
+var gatewayRequestBodySeed = maphash.MakeSeed()
+
+// gatewayRequestBodyState is an immutable snapshot of a successful parse. It
+// owns scalar strings and stores only offsets for large fields, so sharing it
+// between attempts cannot retain an old request body or mutable request state.
+type gatewayRequestBodyState struct {
+	model, metadataUserID, outputEffort, speed string
+	stream, hasSystem, thinkingEnabled         bool
+	maxTokens                                  int
+	protocol                                   string
+	systemRange, messagesRange, inputRange     jsonRange
+	fingerprint                                uint64
+}
+
+func (p *ParsedRequest) saveBodyState() {
+	p.Body.parsed = &gatewayRequestBodyState{
+		model: p.Model, metadataUserID: p.MetadataUserID, outputEffort: p.OutputEffort, speed: p.Speed,
+		stream: p.Stream, hasSystem: p.HasSystem, thinkingEnabled: p.ThinkingEnabled, maxTokens: p.MaxTokens,
+		protocol: p.protocol, systemRange: p.systemRange, messagesRange: p.messagesRange, inputRange: p.inputRange,
+		fingerprint: maphash.Bytes(gatewayRequestBodySeed, p.Body.Bytes()),
+	}
+}
+
+func (p *ParsedRequest) restoreBodyState(state *gatewayRequestBodyState) {
+	p.Model, p.MetadataUserID, p.OutputEffort, p.Speed = state.model, state.metadataUserID, state.outputEffort, state.speed
+	p.Stream, p.HasSystem, p.ThinkingEnabled, p.MaxTokens = state.stream, state.hasSystem, state.thinkingEnabled, state.maxTokens
+	p.protocol = state.protocol
+	p.systemRange, p.messagesRange, p.inputRange = state.systemRange, state.messagesRange, state.inputRange
+}
+
+func (p *ParsedRequest) reusableBodyState(data []byte) *gatewayRequestBodyState {
+	if p.Body == nil || p.Body.parsed == nil || p.Body.parsed.protocol != p.protocol {
+		return nil
+	}
+	current := p.Body.Bytes()
+	// Identity alone would trust the immutable borrowing contract. The content
+	// fingerprint also catches in-place edits of shared storage, which then
+	// reparse as before; it costs one hash pass instead of a full parse.
+	if len(data) == 0 || len(data) != len(current) || &data[0] != &current[0] ||
+		maphash.Bytes(gatewayRequestBodySeed, data) != p.Body.parsed.fingerprint {
+		return nil
+	}
+	return p.Body.parsed
 }
 
 func missingJSONRange() jsonRange {
@@ -135,29 +189,115 @@ func clearGatewayRequestRanges(parsed *ParsedRequest) {
 	parsed.inputRange = missingJSONRange()
 }
 
-func setGatewayRequestRanges(parsed *ParsedRequest, protocol string, jsonStr string) {
+// gatewayRequestRootFields 保存一次根对象遍历取到的原始值视图。全部零拷贝，
+// 只在本次解析内使用，body 被改写后必须重新扫描。
+//
+// 嵌套字段按 gjson.Get 的语义取值：路径的每一段都取「第一个能解析出子键的同名键」，
+// 而不是简单取第一个同名键。例如 {"metadata":"x","metadata":{"user_id":"u"}} 在
+// gjson.Get("metadata.user_id") 下取到 "u"，这里以 Exists() 作为「还没取到」的判据
+// 复现该重试行为。
+type gatewayRequestRootFields struct {
+	model          gjson.Result
+	stream         gjson.Result
+	maxTokens      gjson.Result
+	metadataUID    gjson.Result
+	thinkingType   gjson.Result
+	outputEffort   gjson.Result
+	speed          gjson.Result
+	system         gjson.Result
+	messages       gjson.Result
+	input          gjson.Result
+	contents       gjson.Result
+	geminiSysParts gjson.Result
+}
+
+// scanGatewayRequestRoot 用一次根对象遍历取出解析需要的全部字段。
+//
+// 逐字段 gjson.Get 的问题在于「键不存在」也要把整份 body 扫一遍才能返回不存在：
+// 1 MiB body 上每个缺失键约 142µs，而一次完整遍历约 220µs——解析一次要做 7 次查找，
+// 其中 6 个键（metadata.user_id / thinking.type / output_config.effort / max_tokens /
+// system / messages）在典型 Responses 请求里都不存在。
+func scanGatewayRequestRoot(body []byte) gatewayRequestRootFields {
+	var f gatewayRequestRootFields
+	parseRawJSONView(body).ForEach(func(key, value gjson.Result) bool {
+		switch key.Str {
+		case "model":
+			if !f.model.Exists() {
+				f.model = value
+			}
+		case "stream":
+			if !f.stream.Exists() {
+				f.stream = value
+			}
+		case "max_tokens":
+			if !f.maxTokens.Exists() {
+				f.maxTokens = value
+			}
+		case "metadata":
+			if !f.metadataUID.Exists() {
+				f.metadataUID = value.Get("user_id")
+			}
+		case "thinking":
+			if !f.thinkingType.Exists() {
+				f.thinkingType = value.Get("type")
+			}
+		case "output_config":
+			if !f.outputEffort.Exists() {
+				f.outputEffort = value.Get("effort")
+			}
+		case "speed":
+			if !f.speed.Exists() {
+				f.speed = value
+			}
+		case "system":
+			if !f.system.Exists() {
+				f.system = value
+			}
+		case "messages":
+			if !f.messages.Exists() {
+				f.messages = value
+			}
+		case "input":
+			if !f.input.Exists() {
+				f.input = value
+			}
+		case "contents":
+			if !f.contents.Exists() {
+				f.contents = value
+			}
+		case "systemInstruction":
+			if !f.geminiSysParts.Exists() {
+				f.geminiSysParts = value.Get("parts")
+			}
+		}
+		return true
+	})
+	return f
+}
+
+func setGatewayRequestRangesFromFields(parsed *ParsedRequest, protocol string, fields gatewayRequestRootFields) {
 	if parsed == nil {
 		return
 	}
 	switch protocol {
 	case domain.PlatformGemini:
-		if sysParts := gjson.Get(jsonStr, "systemInstruction.parts"); sysParts.Exists() && sysParts.IsArray() {
-			parsed.systemRange = rangeFromResult(sysParts)
+		if fields.geminiSysParts.Exists() && fields.geminiSysParts.IsArray() {
+			parsed.systemRange = rangeFromResult(fields.geminiSysParts)
 		}
-		if contents := gjson.Get(jsonStr, "contents"); contents.Exists() && contents.IsArray() {
-			parsed.messagesRange = rangeFromResult(contents)
+		if fields.contents.Exists() && fields.contents.IsArray() {
+			parsed.messagesRange = rangeFromResult(fields.contents)
 		}
 	default:
-		if sys := gjson.Get(jsonStr, "system"); sys.Exists() {
+		if fields.system.Exists() {
 			parsed.HasSystem = true
-			parsed.systemRange = rangeFromResult(sys)
+			parsed.systemRange = rangeFromResult(fields.system)
 		}
-		if msgs := gjson.Get(jsonStr, "messages"); msgs.Exists() && msgs.IsArray() {
-			parsed.messagesRange = rangeFromResult(msgs)
+		if fields.messages.Exists() && fields.messages.IsArray() {
+			parsed.messagesRange = rangeFromResult(fields.messages)
 		}
 		if protocol == "responses" {
-			if input := gjson.Get(jsonStr, "input"); input.Exists() {
-				parsed.inputRange = rangeFromResult(input)
+			if fields.input.Exists() {
+				parsed.inputRange = rangeFromResult(fields.input)
 			}
 		}
 	}
@@ -175,28 +315,32 @@ func normalizeClaudeCodeLongContextModel(model string) string {
 	return model
 }
 
-// parseGatewayRequestCurrentBody 只做标量和 raw range 轻量解析，不恢复 system/messages 对象图。
-func parseGatewayRequestCurrentBody(parsed *ParsedRequest, protocol string) error {
+// parseGatewayRequestBody 只做标量和 raw range 轻量解析，不恢复 system/messages 对象图。
+// validate 为 false 时要求调用方已经确认 body 是合法 JSON（见 ParseGatewayRequestValidated）。
+func parseGatewayRequestBody(parsed *ParsedRequest, protocol string, validate bool) error {
 	if parsed == nil || parsed.Body == nil {
 		return fmt.Errorf("empty request body")
 	}
+	parsed.Body.parsed = nil
 
 	bodyBytes := parsed.Body.Bytes()
-	if !gjson.ValidBytes(bodyBytes) {
+	if validate && !gjson.ValidBytes(bodyBytes) {
 		return DescribeInvalidJSON(bodyBytes)
 	}
 
-	// 只在当前函数内零拷贝读取 JSON 字段；ReplaceBody 后必须重新进入本函数刷新派生状态。
-	jsonStr := *(*string)(unsafe.Pointer(&bodyBytes))
+	// Zero-copy JSON reads stay local to parsing. Persisted scalar strings must
+	// own their storage: an unescaped gjson string otherwise retains the complete
+	// request buffer when copied into queued billing work. Raw ranges stay zero-copy.
 	clearGatewayRequestDerivedState(parsed)
 	parsed.protocol = protocol
 
-	modelResult := gjson.Get(jsonStr, "model")
-	if modelResult.Exists() {
-		if modelResult.Type != gjson.String {
+	fields := scanGatewayRequestRoot(bodyBytes)
+
+	if fields.model.Exists() {
+		if fields.model.Type != gjson.String {
 			return fmt.Errorf("invalid model field type")
 		}
-		parsed.Model = modelResult.String()
+		parsed.Model = strings.Clone(fields.model.String())
 		if protocol == domain.PlatformAnthropic {
 			normalizedModel := normalizeClaudeCodeLongContextModel(parsed.Model)
 			if normalizedModel != parsed.Model {
@@ -206,45 +350,46 @@ func parseGatewayRequestCurrentBody(parsed *ParsedRequest, protocol string) erro
 				}
 				parsed.Body.Replace(normalizedBody)
 				bodyBytes = normalizedBody
-				jsonStr = *(*string)(unsafe.Pointer(&bodyBytes))
+				// 改写后旧的值视图指向已失效的字节，重新遍历一次（仅 [1m] 规范化这条罕见路径）。
+				fields = scanGatewayRequestRoot(bodyBytes)
 				parsed.Model = normalizedModel
 			}
 		}
 	}
 
-	streamResult := gjson.Get(jsonStr, "stream")
-	if streamResult.Exists() {
-		if streamResult.Type != gjson.True && streamResult.Type != gjson.False {
+	if fields.stream.Exists() {
+		if fields.stream.Type != gjson.True && fields.stream.Type != gjson.False {
 			return fmt.Errorf("invalid stream field type")
 		}
-		parsed.Stream = streamResult.Bool()
+		parsed.Stream = fields.stream.Bool()
 	}
 
-	parsed.MetadataUserID = gjson.Get(jsonStr, "metadata.user_id").String()
+	parsed.MetadataUserID = strings.Clone(fields.metadataUID.String())
 
-	thinkingType := gjson.Get(jsonStr, "thinking.type").String()
-	parsed.ThinkingEnabled = thinkingType == "enabled" || thinkingType == "adaptive"
+	thinkingType := fields.thinkingType.String()
+	parsed.ThinkingEnabled = thinkingType == "enabled" || thinkingType == "adaptive" || thinkingType == "between_tools" ||
+		(protocol == domain.PlatformAnthropic && isClaude55SignedThinkingModel(parsed.Model))
 
-	parsed.OutputEffort = strings.TrimSpace(gjson.Get(jsonStr, "output_config.effort").String())
+	parsed.OutputEffort = strings.Clone(strings.TrimSpace(fields.outputEffort.String()))
 	if protocol == domain.PlatformAnthropic {
-		parsed.Speed = strings.ToLower(strings.TrimSpace(gjson.Get(jsonStr, "speed").String()))
+		parsed.Speed = strings.Clone(strings.ToLower(strings.TrimSpace(fields.speed.String())))
 	}
 
-	maxTokensResult := gjson.Get(jsonStr, "max_tokens")
-	if maxTokensResult.Exists() && maxTokensResult.Type == gjson.Number {
-		f := maxTokensResult.Float()
+	if fields.maxTokens.Exists() && fields.maxTokens.Type == gjson.Number {
+		f := fields.maxTokens.Float()
 		if !math.IsNaN(f) && !math.IsInf(f, 0) && f == math.Trunc(f) &&
 			f <= float64(math.MaxInt) && f >= float64(math.MinInt) {
 			parsed.MaxTokens = int(f)
 		}
 	}
 
-	setGatewayRequestRanges(parsed, protocol, jsonStr)
+	setGatewayRequestRangesFromFields(parsed, protocol, fields)
+	parsed.saveBodyState()
 	return nil
 }
 
 func refreshGatewayRequestRanges(parsed *ParsedRequest, protocol string) error {
-	return parseGatewayRequestCurrentBody(parsed, protocol)
+	return parseGatewayRequestBody(parsed, protocol, true)
 }
 
 // DescribeInvalidJSON returns a diagnostic error for a request body that
@@ -351,8 +496,20 @@ func normalizeSessionUserAgentFallback(raw string) string {
 // protocol 指定请求协议格式（domain.PlatformAnthropic / domain.PlatformGemini），
 // 不同协议使用不同的 system/messages 字段名。
 func ParseGatewayRequest(body *RequestBodyRef, protocol string) (*ParsedRequest, error) {
+	return parseGatewayRequest(body, protocol, true)
+}
+
+// ParseGatewayRequestValidated 与 ParseGatewayRequest 结果相同，但要求调用方已经确认
+// body 是合法 JSON（例如 handler 已对同一份字节做过 gjson.ValidBytes，且此后的改写只
+// 经过 sjson）。它跳过这次全量校验——1 MiB body 上约 510µs，占解析耗时的七成。
+// 非法 JSON 的语义与未校验版本不同，只允许在校验过同一份字节的调用点使用。
+func ParseGatewayRequestValidated(body *RequestBodyRef, protocol string) (*ParsedRequest, error) {
+	return parseGatewayRequest(body, protocol, false)
+}
+
+func parseGatewayRequest(body *RequestBodyRef, protocol string, validate bool) (*ParsedRequest, error) {
 	parsed := &ParsedRequest{Body: body}
-	if err := parseGatewayRequestCurrentBody(parsed, protocol); err != nil {
+	if err := parseGatewayRequestBody(parsed, protocol, validate); err != nil {
 		return nil, err
 	}
 	return parsed, nil
@@ -417,6 +574,13 @@ func (p *ParsedRequest) CloneForBody(body []byte) (*ParsedRequest, error) {
 	clone := *p
 	clone.Body = NewRequestBodyRef(body)
 	clone.OnUpstreamAccepted = nil
+	if state := p.reusableBodyState(body); state != nil {
+		clone.Body.parsed = state
+		// Restore derived fields just as reparsing would; callers can have
+		// temporarily overridden exported fields such as Model for routing.
+		clone.restoreBodyState(state)
+		return &clone, nil
+	}
 	if err := refreshGatewayRequestRanges(&clone, clone.protocol); err != nil {
 		return nil, err
 	}
@@ -427,6 +591,10 @@ func (p *ParsedRequest) CloneForBody(body []byte) (*ParsedRequest, error) {
 func (p *ParsedRequest) ReplaceBody(data []byte) error {
 	if p == nil {
 		return fmt.Errorf("parse request: empty request")
+	}
+	if state := p.reusableBodyState(data); state != nil {
+		p.restoreBodyState(state)
+		return nil
 	}
 	if p.Body == nil {
 		p.Body = NewRequestBodyRef(data)
@@ -566,6 +734,94 @@ func StripEmptyTextBlocks(body []byte) []byte {
 	return out
 }
 
+// isClaude55SignedThinkingModel identifies models (including Fable/Mythos 5.2) whose default thinking mode
+// requires signed history to survive protocol conversion and request filtering.
+func isClaude55SignedThinkingModel(model string) bool {
+	return claude.IsOpus55(model) || claude.IsSonnet55(model) || claude.IsHaiku55(model) || claude.IsFable52(model) || claude.IsMythos52(model)
+}
+
+// validateClaude55Request rejects settings that the upstream cannot honor.
+// Call before OAuth mimicry can remove tool_choice or alter thinking defaults.
+func validateClaude55Request(body []byte, model string) error {
+	if !isClaude55SignedThinkingModel(model) {
+		return nil
+	}
+	isSonnet55 := claude.IsSonnet55(model)
+	isHaiku55 := claude.IsHaiku55(model)
+	isClaude52 := claude.IsFable52(model) || claude.IsMythos52(model)
+	thinkingType := gjson.GetBytes(body, "thinking.type").String()
+	switch thinkingType {
+	case "disabled", "enabled":
+		if isHaiku55 {
+			// haiku-5-5：enabled 一律 400（用 adaptive）；disabled 仅 high 及以下
+			// 可用，xhigh/max 上 400。见官方 migration guide。
+			if thinkingType == "enabled" {
+				return fmt.Errorf("claude-haiku-5-5 requires adaptive thinking; omit thinking or use thinking.type=adaptive and output_config.effort")
+			}
+			switch gjson.GetBytes(body, "output_config.effort").String() {
+			case "xhigh", "max":
+				return fmt.Errorf("claude-haiku-5-5 thinking.type=disabled supports only low, medium or high effort")
+			}
+			break
+		}
+		if isSonnet55 {
+			return fmt.Errorf("claude-sonnet-5-5 requires adaptive thinking or thinking.type=between_tools; omit thinking or use one of those modes")
+		}
+		return fmt.Errorf("%s requires adaptive thinking; omit thinking or use thinking.type=adaptive and output_config.effort", model)
+	case "between_tools":
+		if !isSonnet55 {
+			if isHaiku55 {
+				return fmt.Errorf("claude-haiku-5-5 requires adaptive thinking; thinking.type=between_tools is unsupported (use thinking.type=disabled at high effort or below)")
+			}
+			return fmt.Errorf("%s requires adaptive thinking; thinking.type=between_tools is unsupported", model)
+		}
+		effort := gjson.GetBytes(body, "output_config.effort").String()
+		if effort == "xhigh" || effort == "max" {
+			return fmt.Errorf("claude-sonnet-5-5 thinking.type=between_tools supports only low, medium or high effort")
+		}
+		for _, field := range []string{"thinking.display", "thinking.budget_tokens", "thinking.block_binding"} {
+			if gjson.GetBytes(body, field).Exists() {
+				return fmt.Errorf("claude-sonnet-5-5 thinking.type=between_tools does not support %s", field)
+			}
+		}
+	}
+	modelName := model
+	if isSonnet55 {
+		modelName = "claude-sonnet-5-5"
+	}
+	if isHaiku55 {
+		modelName = "claude-haiku-5-5"
+	}
+	// haiku-5-5 接受强制 tool_choice（响应以 tool call 开头、无 thinking 块），
+	// 与 opus/sonnet-5-5 不同，不拦截。见官方 migration guide。
+	if !isHaiku55 {
+		if gjson.GetBytes(body, "tool_choice").String() == "required" {
+			return fmt.Errorf("%s does not support forced tool_choice; use auto or none", modelName)
+		}
+		switch gjson.GetBytes(body, "tool_choice.type").String() {
+		case "any", "tool", "function", "custom", "namespace":
+			return fmt.Errorf("%s does not support forced tool_choice; use auto or none", modelName)
+		}
+	}
+	if isSonnet55 || isHaiku55 || isClaude52 {
+		if temperature := gjson.GetBytes(body, "temperature"); temperature.Exists() && (temperature.Type != gjson.Number || temperature.Float() != 1) {
+			return fmt.Errorf("%s does not support non-default temperature", modelName)
+		}
+		// Haiku 5.5 只接受显式 top_p=0.99；保留 Sonnet 5.5 既有的区间策略。
+		if topP := gjson.GetBytes(body, "top_p"); topP.Exists() && (topP.Type != gjson.Number ||
+			((isHaiku55 || isClaude52) && topP.Float() != 0.99) || (isSonnet55 && (topP.Float() < 0.99 || topP.Float() > 1))) {
+			return fmt.Errorf("%s does not support non-default top_p", modelName)
+		}
+		if gjson.GetBytes(body, "top_k").Exists() {
+			return fmt.Errorf("%s does not support top_k", modelName)
+		}
+		if (isHaiku55 || isClaude52) && gjson.GetBytes(body, "temperature").Exists() && gjson.GetBytes(body, "top_p").Exists() {
+			return fmt.Errorf("%s does not allow temperature and top_p together; omit both", modelName)
+		}
+	}
+	return nil
+}
+
 // FilterThinkingBlocks removes thinking blocks from request body
 // Returns filtered body or original body if filtering fails (fail-safe)
 // This prevents 400 errors from invalid thinking block signatures.
@@ -578,13 +834,13 @@ func StripEmptyTextBlocks(body []byte) []byte {
 //
 // 策略 (anthropic-strict only)：
 //   - 当 thinking.type 不是 "enabled"/"adaptive"：移除所有 thinking 相关块
-//   - 当 thinking.type 是 "enabled"/"adaptive"：仅移除缺失/无效 signature 的 thinking 块（避免 400）
-//     (blocks with missing/empty/dummy signatures that would cause 400 errors)
+//   - 当 thinking.type 是 "enabled"/"adaptive"：移除缺失/无效 signature 的 thinking 块（避免 400）
+//   - 对要求签名历史完整的 5.5 模型，一旦有无效块，移除历史中的全部 thinking 块
 func FilterThinkingBlocks(body []byte, mappedModel string) []byte {
 	if !ShouldPreFilterThinkingBlocks(mappedModel) {
 		return body
 	}
-	return filterThinkingBlocksInternal(body, false)
+	return filterThinkingBlocksInternal(body, isClaude55SignedThinkingModel(mappedModel))
 }
 
 // FilterThinkingBlocksForRetry strips thinking-related constructs for retry scenarios.
@@ -655,6 +911,9 @@ func FilterThinkingBlocksForRetry(body []byte, mappedModel string) []byte {
 		bytes.Contains(body, patternThinkingFieldSpaced)
 	if !hasEmptyContent && !hasEmptyTextBlock && !containsThinkingBlocks {
 		if topThinking := gjson.Get(jsonStr, "thinking"); topThinking.Exists() {
+			if claude.IsSonnet55(mappedModel) && topThinking.Get("type").String() == "between_tools" {
+				return body
+			}
 			if out, err := sjson.DeleteBytes(body, "thinking"); err == nil {
 				out = removeThinkingDependentContextStrategies(out)
 				return out
@@ -672,7 +931,9 @@ func FilterThinkingBlocksForRetry(body []byte, mappedModel string) []byte {
 	modified := false
 
 	// Disable top-level thinking mode for retry to avoid structural/signature constraints upstream.
-	deleteTopLevelThinking := gjson.Get(jsonStr, "thinking").Exists()
+	thinkingMode := gjson.Get(jsonStr, "thinking.type").String()
+	deleteTopLevelThinking := gjson.Get(jsonStr, "thinking").Exists() &&
+		(!claude.IsSonnet55(mappedModel) || thinkingMode != "between_tools")
 
 	for i := 0; i < len(messages); i++ {
 		msgMap, ok := messages[i].(map[string]any)
@@ -922,8 +1183,9 @@ const anthropicBetaContextManagementToken = "context-management-2025-06-27"
 //   - pi-ai（Harness 使用的 Anthropic provider）会为 opus5 生成形如
 //     `{"role":"system","content":[],"output_config":{"effort":"high"}}` 的控制消息，
 //     并请求 `mid-conversation-output-config-2026-07-01` beta
-//   - 该 output_config 是 **message 级**字段，只有该 beta 保护；顶层 output_config/effort
-//     不受它约束
+//   - Claude Code 也会以 `per-turn-control-2026-07-01` 请求该能力
+//   - 该 output_config 是 **message 级**字段，由上述任一 beta 保护；顶层 output_config/effort
+//     不受它们约束
 //   - OAuth mimic 用 FullClaudeCodeMimicryBetas 覆盖客户端 beta；固定列表漏该 beta 时
 //     body 字段与 header 不对称 → 上游报 "output_config: Extra inputs are not permitted"
 //   - 缺 token 时净化消息级 output_config（详见 stripAnthropicMessageOutputConfigUnlessBeta）
@@ -974,7 +1236,7 @@ func sanitizeAnthropicBodyForBetaTokens(body []byte, anthropicBetaHeader string)
 		body, changed = b, true
 	}
 
-	// messages[].output_config：mid-conversation-output-config beta 专属字段。
+	// messages[].output_config：需要 mid-conversation-output-config 或 per-turn-control beta。
 	// 顶层 output_config / effort 不受该 beta 约束，本分支只净化消息内字段。
 	if b, deleted := stripAnthropicMessageOutputConfigUnlessBeta(body, anthropicBetaHeader); deleted {
 		body, changed = b, true
@@ -1023,17 +1285,18 @@ func anthropicBetaTokensContains(header, token string) bool {
 }
 
 // stripAnthropicMessageOutputConfigUnlessBeta 在 anthropic-beta header 缺
-// mid-conversation-output-config beta 时，净化 **messages[].output_config**：
+// mid-conversation-output-config 和 per-turn-control 两种 beta 时，净化 **messages[].output_config**：
 //   - 仅为携带 message-level output_config 的消息剥该字段；
 //   - 若该消息 role=system 且 content 无正文（缺失 / null / 空 string / 空 array /
 //     仅空 text 块），整条删除（pi-ai 为 opus5 生成的空 system 控制消息即此形态）；
 //   - system 有正文则保留正文与其余字段；user/assistant 只剥字段，绝不整条删除；
 //   - 无任何消息携带该字段时返回原 body（字节 no-op）。
 //
-// header 含该 beta 时完全保留。顶层 output_config / effort 不属于该 beta 保护范围，
+// header 含任一 beta 时完全保留。顶层 output_config / effort 不属于这些 beta 保护范围，
 // 本函数不做任何处理。多条删除用「稳健重建」实现，保留其余字段与消息先后顺序。
 func stripAnthropicMessageOutputConfigUnlessBeta(body []byte, anthropicBetaHeader string) ([]byte, bool) {
-	if anthropicBetaTokensContains(anthropicBetaHeader, claude.BetaMidConversationOutputConfig) {
+	if anthropicBetaTokensContains(anthropicBetaHeader, claude.BetaMidConversationOutputConfig) ||
+		anthropicBetaTokensContains(anthropicBetaHeader, claude.BetaPerTurnControl) {
 		return body, false
 	}
 	// 快速路径：body 中不含 output_config 字面量时无需解析。
@@ -1320,8 +1583,10 @@ func FilterSignatureSensitiveBlocksForRetry(body []byte, mappedModel string) []b
 // filterThinkingBlocksInternal removes invalid thinking blocks from request
 // 策略：
 //   - 当 thinking.type 不是 "enabled"/"adaptive"：移除所有 thinking 相关块
-//   - 当 thinking.type 是 "enabled"/"adaptive"：仅移除缺失/无效 signature 的 thinking 块
-func filterThinkingBlocksInternal(body []byte, _ bool) []byte {
+//   - 当 thinking.type 是 "enabled"/"adaptive"：移除缺失/无效 signature 的 thinking 块
+//   - 对 5.5 模型，只要历史中有无效 thinking，就移除所有 thinking/redacted_thinking，
+//     避免留下不连续的签名历史
+func filterThinkingBlocksInternal(body []byte, alwaysThinking bool) []byte {
 	// Fast path: if body doesn't contain "thinking", skip parsing
 	if !bytes.Contains(body, []byte(`"type":"thinking"`)) &&
 		!bytes.Contains(body, []byte(`"type": "thinking"`)) &&
@@ -1331,14 +1596,124 @@ func filterThinkingBlocksInternal(body []byte, _ bool) []byte {
 		!bytes.Contains(body, []byte(`"thinking" :`)) {
 		return body
 	}
+	// Signed thinking history and top-level thinking config defeat the substring
+	// check on most requests; decide without decoding when nothing is dropped.
+	if needs, decided := thinkingBlocksNeedFiltering(body, alwaysThinking); decided && !needs {
+		return body
+	}
+	return filterThinkingBlocksDecoded(body, alwaysThinking)
+}
 
+// thinkingBlocksNeedFiltering reports whether filterThinkingBlocksDecoded would
+// drop a block, mirroring its decisions on borrowed gjson views with
+// encoding/json's last-wins rule for duplicate keys. The body is borrowed only
+// during this call. A non-object root is left to the decoding path
+// (decided=false). Invalid JSON needs no separate scan: the decoding path
+// returns it unchanged, so either answer yields the same body.
+func thinkingBlocksNeedFiltering(body []byte, alwaysThinking bool) (needs, decided bool) {
+	view := openAIWSPayloadStringView(body)
+	root := gjson.Parse(view)
+	if !root.IsObject() {
+		return false, false
+	}
+	var thinking, messages gjson.Result
+	root.ForEach(func(key, value gjson.Result) bool {
+		switch key.String() {
+		case "thinking":
+			thinking = value
+		case "messages":
+			messages = value
+		}
+		return true
+	})
+
+	thinkingEnabled := alwaysThinking
+	if thinking.IsObject() {
+		var thinkType gjson.Result
+		thinking.ForEach(func(key, value gjson.Result) bool {
+			if key.String() == "type" {
+				thinkType = value
+			}
+			return true
+		})
+		if thinkType.Type == gjson.String && (thinkType.Str == "enabled" || thinkType.Str == "adaptive") {
+			thinkingEnabled = true
+		}
+	}
+	if !messages.IsArray() {
+		return false, true
+	}
+
+	messages.ForEach(func(_, msg gjson.Result) bool {
+		if !msg.IsObject() {
+			return true
+		}
+		var role, content gjson.Result
+		msg.ForEach(func(key, value gjson.Result) bool {
+			switch key.String() {
+			case "role":
+				role = value
+			case "content":
+				content = value
+			}
+			return true
+		})
+		if !content.IsArray() {
+			return true
+		}
+		isAssistant := role.Type == gjson.String && role.Str == "assistant"
+		content.ForEach(func(_, block gjson.Result) bool {
+			if !block.IsObject() {
+				return true
+			}
+			var blockType, data, signature gjson.Result
+			hasThinking := false
+			block.ForEach(func(key, value gjson.Result) bool {
+				switch key.String() {
+				case "type":
+					blockType = value
+				case "data":
+					data = value
+				case "signature":
+					signature = value
+				case "thinking":
+					hasThinking = true
+				}
+				return true
+			})
+			typ := ""
+			if blockType.Type == gjson.String {
+				typ = blockType.Str
+			}
+			switch {
+			case typ == "thinking" || typ == "redacted_thinking":
+				if thinkingEnabled && isAssistant {
+					if alwaysThinking && typ == "redacted_thinking" && data.Type == gjson.String && data.Str != "" {
+						return true
+					}
+					if signature.Type == gjson.String && signature.Str != "" && signature.Str != antigravity.DummyThoughtSignature {
+						return true
+					}
+				}
+				needs = true
+			case typ == "" && hasThinking:
+				needs = true
+			}
+			return !needs
+		})
+		return !needs
+	})
+	return needs, true
+}
+
+func filterThinkingBlocksDecoded(body []byte, alwaysThinking bool) []byte {
 	var req map[string]any
 	if err := json.Unmarshal(body, &req); err != nil {
 		return body
 	}
 
 	// Check if thinking is enabled
-	thinkingEnabled := false
+	thinkingEnabled := alwaysThinking
 	if thinking, ok := req["thinking"].(map[string]any); ok {
 		if thinkType, ok := thinking["type"].(string); ok && (thinkType == "enabled" || thinkType == "adaptive") {
 			thinkingEnabled = true
@@ -1379,6 +1754,12 @@ func filterThinkingBlocksInternal(body []byte, _ bool) []byte {
 				// When thinking is enabled and this is an assistant message,
 				// only keep thinking blocks with valid signatures
 				if thinkingEnabled && role == "assistant" {
+					if alwaysThinking && blockType == "redacted_thinking" {
+						if data, ok := blockMap["data"].(string); ok && data != "" {
+							newContent = append(newContent, block)
+							continue
+						}
+					}
 					signature, _ := blockMap["signature"].(string)
 					if signature != "" && signature != antigravity.DummyThoughtSignature {
 						newContent = append(newContent, block)
@@ -1409,6 +1790,44 @@ func filterThinkingBlocksInternal(body []byte, _ bool) []byte {
 
 	if !filtered {
 		return body
+	}
+	if alwaysThinking {
+		for _, msg := range messages {
+			msgMap, ok := msg.(map[string]any)
+			if !ok {
+				continue
+			}
+			content, ok := msgMap["content"].([]any)
+			if !ok {
+				continue
+			}
+			cleaned := make([]any, 0, len(content))
+			for _, block := range content {
+				blockMap, ok := block.(map[string]any)
+				if !ok {
+					cleaned = append(cleaned, block)
+					continue
+				}
+				blockType, _ := blockMap["type"].(string)
+				if blockType == "thinking" || blockType == "redacted_thinking" {
+					continue
+				}
+				if blockType == "" {
+					if _, hasThinking := blockMap["thinking"]; hasThinking {
+						continue
+					}
+				}
+				cleaned = append(cleaned, block)
+			}
+			if len(cleaned) == 0 {
+				placeholder := "(content removed)"
+				if role, _ := msgMap["role"].(string); role == "assistant" {
+					placeholder = "(assistant content removed)"
+				}
+				cleaned = append(cleaned, map[string]any{"type": "text", "text": placeholder})
+			}
+			msgMap["content"] = cleaned
+		}
 	}
 
 	newBody, err := json.Marshal(req)
@@ -1607,12 +2026,16 @@ const (
 
 // isThinkingBudgetConstraintError detects whether an upstream error message indicates
 // a budget_tokens constraint violation (e.g. "budget_tokens >= 1024").
-// Matches three conditions (all must be true):
+// Also recognizes Baseten's final-answer reserve constraint.
+// For the original budget constraint, all three conditions must be true:
 //  1. Contains "budget_tokens" or "budget tokens"
 //  2. Contains "thinking"
 //  3. Contains ">= 1024" or "greater than or equal to 1024" or ("1024" + "input should be")
 func isThinkingBudgetConstraintError(errMsg string) bool {
 	m := strings.ToLower(errMsg)
+	if isFinalAnswerReserveError(m) {
+		return true
+	}
 
 	// Condition 1: budget_tokens or budget tokens
 	hasBudget := strings.Contains(m, "budget_tokens") || strings.Contains(m, "budget tokens")
@@ -1634,6 +2057,14 @@ func isThinkingBudgetConstraintError(errMsg string) bool {
 	}
 
 	return false
+}
+
+// isFinalAnswerReserveError matches the specific reserve constraint, rather than
+// treating arbitrary reasoning quota or context-length errors as repairable.
+func isFinalAnswerReserveError(errMsg string) bool {
+	m := strings.ToLower(errMsg)
+	return strings.Contains(m, "must be greater than 1024 to reserve tokens for a final answer") &&
+		strings.Contains(m, "baseten reasoning is enabled")
 }
 
 // RectifyThinkingBudget modifies the request body to fix budget_tokens constraint errors.

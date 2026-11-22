@@ -4,7 +4,10 @@ import (
 	"context"
 	"strings"
 
+	"github.com/Wei-Shaw/sub2api/internal/domain"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // WithResolvedTargetPlatform stores the concrete provider chosen for a request
@@ -48,6 +51,18 @@ func WithCompositeRouteDecision(ctx context.Context, decision CompositeRouteDeci
 	return ctx
 }
 
+// RewriteCompositeRequestModel puts a composite route's upstream model into the
+// request body at modelPath. The client chose its thinking mode for the model
+// it asked for, so a mode the upstream model rejects becomes the nearest mode
+// it accepts. The body is returned unchanged when it cannot be rewritten.
+func RewriteCompositeRequestModel(body []byte, modelPath, upstreamModel string) []byte {
+	rewritten, err := sjson.SetBytes(body, modelPath, upstreamModel)
+	if err != nil {
+		return body
+	}
+	return adaptThinkingToClaude55(rewritten, upstreamModel)
+}
+
 func ResolvedUpstreamModelFromContext(ctx context.Context) (string, bool) {
 	if ctx == nil {
 		return "", false
@@ -70,6 +85,33 @@ func RequestedPublicModelFromContext(ctx context.Context) (string, bool) {
 		return "", false
 	}
 	return model, true
+}
+
+// compositeClientModel returns the public model the client asked for when a
+// composite route sent a different model upstream, and fallback otherwise. The
+// response reports that public name whatever model the upstream says served it.
+func compositeClientModel(ctx context.Context, fallback string) string {
+	publicModel, ok := RequestedPublicModelFromContext(ctx)
+	if !ok {
+		return fallback
+	}
+	if upstreamModel, ok := ResolvedUpstreamModelFromContext(ctx); !ok || upstreamModel == publicModel {
+		return fallback
+	}
+	return publicModel
+}
+
+// restoreCompositeClientModel reports the client's public model in an Anthropic
+// response body when a composite route rewrote the model.
+func restoreCompositeClientModel(ctx context.Context, body []byte) []byte {
+	clientModel := compositeClientModel(ctx, "")
+	if clientModel == "" || !gjson.GetBytes(body, "model").Exists() {
+		return body
+	}
+	if rewritten, err := sjson.SetBytes(body, "model", clientModel); err == nil {
+		return rewritten
+	}
+	return body
 }
 
 func CompositeRouteSourceFromContext(ctx context.Context) (string, bool) {
@@ -114,6 +156,8 @@ func DetectModelPlatform(model string) (string, bool) {
 			return PlatformDeepseek, true
 		case "minimax":
 			return PlatformMiniMax, true
+		case "typesafe", "jev":
+			return PlatformTypeSafe, true
 		}
 		if rest != "" {
 			normalized = strings.TrimPrefix(rest, "models/")
@@ -155,6 +199,8 @@ func DetectModelPlatform(model string) (string, bool) {
 		strings.HasPrefix(normalized, "abab6"),
 		strings.HasPrefix(normalized, "abab7"):
 		return PlatformMiniMax, true
+	case normalized == "jev-latest" || strings.HasPrefix(normalized, "jev-"):
+		return PlatformTypeSafe, true
 	default:
 		return "", false
 	}
@@ -200,11 +246,5 @@ func (s *GatewayService) resolveCompositeRouteDecision(ctx context.Context, grou
 }
 
 func isConcreteRequestPlatform(platform string) bool {
-	switch platform {
-	case PlatformAnthropic, PlatformOpenAI, PlatformGemini, PlatformAntigravity, PlatformGrok,
-		PlatformKimi, PlatformZhipu, PlatformDeepseek, PlatformMiniMax, PlatformOpenCodeGo:
-		return true
-	default:
-		return false
-	}
+	return domain.IsConcretePlatform(platform)
 }
